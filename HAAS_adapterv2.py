@@ -1,4 +1,10 @@
-import threading, time, socket, sys, datetime, serial, re
+import threading
+import time
+import socket
+import sys
+import os
+import datetime
+import linuxcnc
 
 client_counter = 0
 client_list = []
@@ -7,251 +13,245 @@ lock = threading.Lock()
 event = threading.Event()
 event.set()
 
-# Initialising 7 global attributes for HAAS serial comm macros
+# Global attributes for adapter output
 mac_status = part_num = prog_name = sspeed = coolant = sload = cut_status = combined_output = 'Nil'
 
-"""Creating Socket Objects"""
+# Socket config
 HOST = ''
-PORT = 7000
+PORT = 7878
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-"""Binding to the local port/host"""
 try:
     s.bind((HOST, PORT))
 except socket.error as msg:
-    print ('Bind failed. Error Code : ' + str(msg[0]) + ' Message ' + msg[1])
+    print('Bind failed. Error Code : ' + str(msg[0]) + ' Message ' + msg[1])
     sys.exit()
 
-"""Start Listening to Socket for Clients"""
 s.listen(5)
-
-"""Function to Clear Out Threads List Once All Threads are Empty"""
 
 
 def thread_list_empty():
-    global client_list, client_counter
+    """Clear out finished client threads."""
+    global client_list, client_counter, first_run_flag
 
     while True:
         try:
-            if client_counter == 0 and first_run_flag == 0 and client_list != []:
+            if client_counter == 0 and first_run_flag == 0 and client_list:
                 print("%d Clients Active" % client_counter)
-                print("Clearing All threads....")
-                for index, thread in enumerate(client_list):
+                print("Clearing all threads....")
+                for thread in client_list:
                     thread.join()
                 client_list = []
-        except:
-            print("Invalid Client List Deletion")
-
-
-"""Function that parses attributes from the HAAS"""
+        except Exception as e:
+            print("Invalid Client List Deletion:", e)
+        time.sleep(1)
 
 
 def fetch_from_HAAS():
+    """
+    Periodically poll LinuxCNC and build the MTConnect-style output string.
+
+    Here we mainly care about "online" status:
+    - mac_status = 'ON' if LinuxCNC task is ON / ESTOP_RESET and enabled, estop not active
+    - mac_status = 'OFF' otherwise
+    """
     global mac_status, part_num, prog_name, sspeed, coolant, sload, cut_status, combined_output
 
-
-    ser = serial.Serial()
-    ser.baudrate = 9600
-    # Assuming HAAS is connected to ttyUSB0 port of Linux System
-    ser.port = '/dev/ttyUSB0'
-    ser.timeout = 1
-
     try:
-        ser.open()
-    except serial.SerialException:
-        if ser.is_open:
-            try:
-                print("Port was open. Attempting to close.")
-                ser.close()
-                time.sleep(2)
-                ser.open()
-            except:
-                print("Port is already open. Failed to close. Try again.")
-                event.clear()
-        else:
-            print("Failed to connect to serial port. Make sure it is free or it exists. Try again.")
-            event.clear()
+        stat = linuxcnc.stat()
+    except linuxcnc.error as e:
+        print("Failed to connect to LinuxCNC status channel:", e)
+        event.clear()
+        return
 
-    while True:
+    # Try to get machine name from ini (optional)
+    try:
+        stat.poll()
+        inifile = linuxcnc.ini(stat.ini_filename)
+        machine_name = inifile.find("EMC", "MACHINE") or "unknown"
+        print("Machine name:", machine_name)
+    except Exception as e:
+        print("Could not read INI / machine name:", e)
+
+    while event.is_set():
         out = ''
-        try:
-            # Reading Status
-            ser.write(b"Q500\r")
-            status = ser.readline()
-            status = status[2:-3]
-            print(status)
 
-            if status != '':
+        try:
+            stat.poll()
+        except linuxcnc.error as e:
+            # If poll fails, assume machine is offline
+            mac_status = 'OFF'
+            combined_output = '\r\n' + datetime.datetime.now().isoformat() + 'Z' + '|power|OFF'
+            print("LinuxCNC status poll failed:", e)
+            time.sleep(1.0)
+            continue
+
+        # --- ONLINE / POWER STATUS ---
+        try:
+            # Conservative definition of "ON"
+            if (stat.task_state in (linuxcnc.STATE_ON, linuxcnc.STATE_ESTOP_RESET)
+                    and not stat.estop
+                    and stat.enabled):
                 mac_status = 'ON'
             else:
                 mac_status = 'OFF'
+        except AttributeError:
+            # Fallback if some attributes missing
+            mac_status = 'OFF'
 
-            out += '|power|' + str(mac_status)
+        out += '|power|' + str(mac_status)
+        
+        # --- ACTIVE TOOL INFO (number, length, diameter) ---
+        try:
+                tool_no = int(getattr(stat, 'tool_in_spindle', 0) or 0)    
+                tool_len = 'UNAVAILABLE'
+                tool_dia = 'UNAVAILABLE'
+        except (TypeError, ValueError):
+                tool_no = 0
+                
+        tool_table = getattr(stat, 'tool_table', None)
+        if tool_table and tool_no:
+                for entry in tool_table:
+                # Many LinuxCNC builds expose tool_result objects,
+                # but some give plain tuples – handle both.
+                        try:
+                                tnum = getattr(entry, 'toolno', getattr(entry, 'id', None))
+                                if tnum != tool_no:
+                                        continue
+                                tool_len = getattr(entry, 'zoffset', tool_len)
+                                tool_dia = getattr(entry, 'diameter', tool_dia)
+                                break
+                        except AttributeError:
+                        # Fallback: standard tuple layout:
+                        # (toolno, pocket, xoff, zoff, aoff, boff, coff, uoff, voff, woff, diameter, frontangle, backangle, orientation)
+                                if len(entry) > 10 and entry[0] == tool_no:
+                                        tool_len = entry[3]   # zoffset
+                                        tool_dia = entry[10]  # diameter
+                                        break
+                        
+        # --- PROGRAM / PART COUNT (simple placeholders) ---
+        try:
+            prog_full = getattr(stat, "file", "")
+            prog_name = os.path.basename(prog_full) if prog_full else "Nil"
+        except AttributeError:
+            prog_name = 'Nil'
 
-            if 'PART' in status:
-                part_num = (re.findall(r"[-+]?\d*\.\d+|\d+", status.split(',')[-1])[0])
-                prog_name = status.split(',')[1]
-            else:
-                part_num = 'Nil'
-                prog_name = 'Nil'
-            out += '|PartCountAct|' + str(part_num) + '|program|' + str(prog_name)
+        # You can hook this to an actual counter if you want
+        part_num = 0
 
-            # Reading Spindle Speed
+        out += '|PartCountAct|' + str(part_num)
+        out += '|program|' + str(prog_name)
 
-            try:
-                ser.write(b"Q600 3027\r")
-                sspeed = ser.readline()
-                sspeed = str(float(sspeed[15:26]))
-            except:
-                sspeed = 'Nil'
-            out += '|Srpm|' + sspeed
+        # --- SPINDLE SPEED (optional; ignore errors) ---
+        # --- SPINDLE SPEED (actual RPM) ---
+        try:
+                if hasattr(stat, "spindle"):
+                # Newer LinuxCNC: spindle dict
+                        sspeed = "{:.4f}".format(stat.spindle[0]['speed'])   # float RPM, >0 CW, <0 CCW
+                else:
+                # Older LinuxCNC: legacy attribute, if present
+                        sspeed = "{:.4f}".format(getattr(stat, "spindle_speed", 0.0))
+                if sspeed is None:
+                        sspeed = 0.0
+        except Exception as e:
+                print("Error reading spindle speed:", e)
+                sspeed = 0.0
 
-            # Reading Coolant Level
-            try:
-                ser.write(b"Q600 1094\r")
-                coolant = ser.readline()
-                coolant = str(float(coolant[15:26]))
-            except:
-                pass
+        # --- COOLANT / LOAD / EXECUTION (stubbed for now) ---
+        coolant = 'Nil'
+        sload = 'Nil'
+        cut_status = 'Nil'
+        out += '|Sload|' + sload
+        out += '|execution|' + cut_status
 
-            # Quering Spindle Load
-            try:
-                ser.write(b"Q600 1098\r")
-                sload = ser.readline()
-                sload = str(float(sload[15:26]))
-            except:
-                sload = 'Nil'
-            out += '|Sload|' + sload
+        # --- POSITION (optional, stubbed) ---
+        pos = getattr(stat, "actual_position", None)
+        if pos and len(pos) >= 3:
+                x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+                # Format like Haas: space-separated vector
+                #xyzact = "{:.4f} {:.4f}; {:.4f}".format(x, y, z)
+                xact = "{:.4f}".format(x)
+                yact = "{:.4f}".format(y)
+                zact = "{:.4f}".format(z)
+        else:
+                #xyzact = ''
+                xact = ''
+                yact = ''
+                zact = ''
+        #out = f'|xyzact|{xyzact}'
+        out = f'|Xact|{xact}'
+        out += f'|Yact|{yact}'
+        out += f'|Zact|{zact}'
+        out += f'|tool_no|{tool_no}'
+        out += f'|tool_length|{tool_len}'
+        out += f'|tool_radius|{tool_dia}'
+        out += f'|Srpm|{sspeed}'
+	          
 
-            # Quering Cutting Status
-            try:
-                cut_status = status.split(',')[status.split(',').index('PARTS') - 1]
-                if 'FEED' in cut_status:
-                    cut_status = 'FEED_HOLD'
-                elif 'IDLE' in cut_status:
-                    cut_status = 'IDLE'
-            except:
-                cut_status = 'Nil'
-            out += '|execution|' + cut_status
+        # Final combined output line
+        combined_output = '\r\n' + datetime.datetime.now().isoformat() + 'Z' + out
 
-            # Present Machine Coordinates
-            try:
-                ser.write(b"Q600 5021\r")
-                coord_x = ser.readline()
-                coord_x = coord_x[15:27]
-            except:
-                coord_x = 'Nil'
-            # Including this since machine OFF doesnt raise x/y/z parsing exception
-            if coord_x == '':
-                coord_x = 'Nil'
-            out += '|Xabs|' + str(coord_x).replace(" ", "")
-
-            try:
-                ser.write(b"Q600 5022\r")
-                coord_y = ser.readline()
-                coord_y = coord_y[15:27]
-            except:
-                coord_y = 'Nil'
-            if coord_y == '':
-                coord_y = 'Nil'
-            out += '|Yabs|' + str(coord_y).replace(" ", "")
-
-            try:
-                ser.write(b"Q600 5023\r")
-                coord_z = ser.readline()
-                coord_z = coord_z[15:27]
-            except:
-                coord_z = 'Nil'
-            if coord_z == '':
-                coord_z = 'Nil'
-            out += '|Zabs|' + str(coord_z).replace(" ", "")
-
-            try:
-                ser.write(b"Q600 5024\r")
-                coord_a = ser.readline()
-                coord_a = coord_a[15:27]
-            except:
-                coord_a = 'Nil'
-            if coord_a == '':
-                coord_a = 'Nil'
-            out += '|Aabs|' + str(coord_a).replace(" ", "")
-
-            # Final data purge
-            combined_output = '\r\n' + datetime.datetime.now().isoformat() + 'Z' + out
-
-        except:
-            print("Failed fetching values from machine")
-            time.sleep(2)
-
-        # time.sleep(0.1)
-
-    ser.close()
-
-
-"""Main Thread Class For Clients"""
+        time.sleep(0.2)
 
 
 class NewClientThread(threading.Thread):
-    # init method called on thread object creation,
     def __init__(self, conn, string_address):
         threading.Thread.__init__(self)
         self.connection_object = conn
         self.client_ip = string_address
 
-    # run method called on .start() execution
     def run(self):
-        global client_counter, combined_output
-        global lock
+        global client_counter, combined_output, lock
         while True:
             try:
-                print("Sending data to Client {} in {}".format(self.client_ip, self.getName()))
+                print(f"Sending data to Client {self.client_ip} in {self.getName()}")
                 out = combined_output
-                self.connection_object.sendall(out)
+                # Ensure bytes for Python 3
+                self.connection_object.sendall(out.encode('ascii', errors='ignore'))
                 time.sleep(0.5)
 
-            except:
+            except Exception as e:
+                print("Client send failed:", e)
                 lock.acquire()
                 try:
-                    client_counter = client_counter - 1
+                    client_counter -= 1
                     print("Connection disconnected for ip {} ".format(self.client_ip))
                     break
                 finally:
                     lock.release()
 
 
-"""Starts From Here"""
-t1 = threading.Thread(target=thread_list_empty)
-t2 = threading.Thread(target=fetch_from_HAAS)
-t1.setDaemon(True)
-t2.setDaemon(True)
+# --- Main startup ---
+t1 = threading.Thread(target=thread_list_empty, daemon=True)
+t2 = threading.Thread(target=fetch_from_HAAS, daemon=True)
 t1.start()
 t2.start()
 time.sleep(2)
 
 while event.is_set():
-
     if first_run_flag == 1:
         print("Listening to Port: %d...." % PORT)
-
 
     try:
         conn, addr = s.accept()
         lock.acquire()
-        client_counter = client_counter + 1
+        client_counter += 1
         first_run_flag = 0
-        print("Accepting Comm From:" + " " + str(addr))
-        new_Client_Thread = NewClientThread(conn, str(addr))
-        new_Client_Thread.setDaemon(True)
-        client_list.append(new_Client_Thread)
-        print(client_list)
-        new_Client_Thread.start()
+        print("Accepting Comm From:", addr)
+        new_client_thread = NewClientThread(conn, str(addr))
+        new_client_thread.setDaemon(True)
+        client_list.append(new_client_thread)
+        new_client_thread.start()
         lock.release()
     except KeyboardInterrupt:
         print("\nExiting Program")
-        sys.exit()
+        event.clear()
+        break
+    except Exception as e:
+        print("Error accepting connection:", e)
 
-if not event.is_set():
-    print("\nExiting Program")
-    sys.exit()
+print("\nExiting Program")
+sys.exit()
+
