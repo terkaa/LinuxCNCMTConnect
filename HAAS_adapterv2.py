@@ -16,7 +16,7 @@ event.set()
 # Global attributes for adapter output
 mac_status = part_num = prog_name = sspeed = coolant = sload = cut_status = combined_output = 'Nil'
 
-# Socket config
+# Socket config d
 HOST = ''
 PORT = 7878
 
